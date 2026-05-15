@@ -43,6 +43,7 @@ START_ARCHIVE = "<!-- START:ARCHIVE -->"
 END_ARCHIVE = "<!-- END:ARCHIVE -->"
 
 
+# UPDATED QUERY: added media { videoUrl } AND topics { name }
 QUERY_POSTS = r"""
 query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: DateTime) {
   posts(first: $first, after: $after, postedAfter: $postedAfter, postedBefore: $postedBefore) {
@@ -58,6 +59,12 @@ query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: 
         website
         votesCount
         commentsCount
+        media {
+          videoUrl
+        }
+        topics {
+          name
+        }
       }
     }
   }
@@ -179,6 +186,12 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
         for e in edges:
             node = (e or {}).get("node")
             if node:
+                # Ensure media is always a list (API may return None)
+                if "media" not in node or node["media"] is None:
+                    node["media"] = []
+                # Ensure topics is always a list
+                if "topics" not in node or node["topics"] is None:
+                    node["topics"] = []
                 items.append(node)
 
         page = conn.get("pageInfo") or {}
@@ -238,9 +251,10 @@ def compute_daily_stats(posts: list[dict]) -> DailyStats:
 
 
 def render_posts_table(posts: list[dict]) -> str:
+    # UPDATED: added Categories column
     lines: list[str] = []
-    lines.append("| # | App | Description | Votes | Comments | Website |")
-    lines.append("|---:|---|---|---:|---:|---|")
+    lines.append("| # | App | Description | Votes | Comments | Website | Video | Categories |")
+    lines.append("|---:|---|---|---:|---:|---|---|---|")
 
     posts_sorted = sorted(posts, key=lambda p: int(p.get("votesCount") or 0), reverse=True)
 
@@ -256,8 +270,20 @@ def render_posts_table(posts: list[dict]) -> str:
 
         website_cell = website_icon_link(p.get("website") or "")
 
+        # Extract first video URL from media array
+        media = p.get("media") or []
+        video_url = ""
+        if media and isinstance(media, list) and len(media) > 0:
+            video_url = media[0].get("videoUrl") or ""
+        video_cell = safe_link("🎥 Watch", video_url) if video_url else "—"
+
+        # Extract topic names and join with semicolons
+        topics_list = p.get("topics") or []
+        topic_names = [t.get("name", "") for t in topics_list if isinstance(t, dict)]
+        categories_cell = "; ".join(topic_names) if topic_names else "—"
+
         lines.append(
-            f"| {i} | {app_cell} | {desc_cell} | {votes} | {comments} | {website_cell} |"
+            f"| {i} | {app_cell} | {desc_cell} | {votes} | {comments} | {website_cell} | {video_cell} | {categories_cell} |"
         )
 
     return "\n".join(lines) + "\n"
@@ -362,7 +388,6 @@ def build_daily_report_md(
     launches.append(render_posts_table(posts))
 
     return header + follow_me + "\n".join(summary) + "\n" + "\n".join(launches)
-
 
 
 def build_today_readme_block(
