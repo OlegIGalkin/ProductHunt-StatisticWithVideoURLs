@@ -43,7 +43,7 @@ START_ARCHIVE = "<!-- START:ARCHIVE -->"
 END_ARCHIVE = "<!-- END:ARCHIVE -->"
 
 
-# UPDATED QUERY: added media { videoUrl } AND topics { name }
+# CORRECTED QUERY: media as list, topics as connection with edges/node
 QUERY_POSTS = r"""
 query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: DateTime) {
   posts(first: $first, after: $after, postedAfter: $postedAfter, postedBefore: $postedBefore) {
@@ -63,7 +63,11 @@ query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: 
           videoUrl
         }
         topics {
-          name
+          edges {
+            node {
+              name
+            }
+          }
         }
       }
     }
@@ -189,9 +193,14 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
                 # Ensure media is always a list (API may return None)
                 if "media" not in node or node["media"] is None:
                     node["media"] = []
-                # Ensure topics is always a list
-                if "topics" not in node or node["topics"] is None:
-                    node["topics"] = []
+                # Normalize topics: from connection to simple list of topic names
+                topics_conn = node.get("topics") or {}
+                topic_edges = topics_conn.get("edges") or []
+                node["topics"] = []
+                for te in topic_edges:
+                    topic_node = te.get("node")
+                    if topic_node and topic_node.get("name"):
+                        node["topics"].append({"name": topic_node["name"]})
                 items.append(node)
 
         page = conn.get("pageInfo") or {}
@@ -251,7 +260,7 @@ def compute_daily_stats(posts: list[dict]) -> DailyStats:
 
 
 def render_posts_table(posts: list[dict]) -> str:
-    # UPDATED: added Categories column
+    # Table includes Video and Categories columns
     lines: list[str] = []
     lines.append("| # | App | Description | Votes | Comments | Website | Video | Categories |")
     lines.append("|---:|---|---|---:|---:|---|---|---|")
@@ -277,9 +286,9 @@ def render_posts_table(posts: list[dict]) -> str:
             video_url = media[0].get("videoUrl") or ""
         video_cell = safe_link("🎥 Watch", video_url) if video_url else "—"
 
-        # Extract topic names and join with semicolons
-        topics_list = p.get("topics") or []
-        topic_names = [t.get("name", "") for t in topics_list if isinstance(t, dict)]
+        # Extract topic names – now 'topics' is already a list of dicts
+        topics = p.get("topics") or []
+        topic_names = [t.get("name", "") for t in topics if isinstance(t, dict)]
         categories_cell = "; ".join(topic_names) if topic_names else "—"
 
         lines.append(
