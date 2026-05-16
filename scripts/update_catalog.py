@@ -25,7 +25,6 @@ from __future__ import annotations
 import html
 import json
 import os
-import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -43,7 +42,7 @@ START_ARCHIVE = "<!-- START:ARCHIVE -->"
 END_ARCHIVE = "<!-- END:ARCHIVE -->"
 
 
-# CORRECTED QUERY: media as list, topics as connection with edges/node
+# Correct GraphQL query – media list, topics as connection
 QUERY_POSTS = r"""
 query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: DateTime) {
   posts(first: $first, after: $after, postedAfter: $postedAfter, postedBefore: $postedBefore) {
@@ -107,7 +106,6 @@ def website_icon_link(website: str) -> str:
     w = (website or "").strip()
     if not w:
         return "—"
-    # icon-only link (no full URL text)
     return f"[🔗](<{w}>)"
 
 
@@ -119,7 +117,6 @@ def build_description_cell(tagline: str, description: str) -> str:
         return "—"
 
     if not short and full:
-        # Fallback: short line from description
         short = full
         if len(short) > 180:
             short = short[:177].rstrip() + "…"
@@ -190,10 +187,9 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
         for e in edges:
             node = (e or {}).get("node")
             if node:
-                # Ensure media is always a list (API may return None)
                 if "media" not in node or node["media"] is None:
                     node["media"] = []
-                # Normalize topics: from connection to simple list of topic names
+                # Normalize topics from connection to list of dicts
                 topics_conn = node.get("topics") or {}
                 topic_edges = topics_conn.get("edges") or []
                 node["topics"] = []
@@ -260,7 +256,6 @@ def compute_daily_stats(posts: list[dict]) -> DailyStats:
 
 
 def render_posts_table(posts: list[dict]) -> str:
-    # Table includes Video and Categories columns
     lines: list[str] = []
     lines.append("| # | App | Description | Votes | Comments | Website | Video | Categories |")
     lines.append("|---:|---|---|---:|---:|---|---|---|")
@@ -279,14 +274,14 @@ def render_posts_table(posts: list[dict]) -> str:
 
         website_cell = website_icon_link(p.get("website") or "")
 
-        # Extract first video URL from media array
+        # Video URL from media[0].videoUrl
         media = p.get("media") or []
         video_url = ""
         if media and isinstance(media, list) and len(media) > 0:
             video_url = media[0].get("videoUrl") or ""
         video_cell = safe_link("🎥 Watch", video_url) if video_url else "—"
 
-        # Extract topic names – now 'topics' is already a list of dicts
+        # Categories: join topic names with semicolons
         topics = p.get("topics") or []
         topic_names = [t.get("name", "") for t in topics if isinstance(t, dict)]
         categories_cell = "; ".join(topic_names) if topic_names else "—"
@@ -308,12 +303,21 @@ def write_text(path: str, content: str) -> None:
         f.write(content)
 
 
+# FIXED: No regex, simple string search/replace – avoids escape sequence issues
 def replace_block(text: str, start: str, end: str, new_block: str) -> str:
-    pattern = re.compile(re.escape(start) + r".*?" + re.escape(end), flags=re.DOTALL)
-    replacement = f"{start}\n{new_block}\n{end}"
-    if pattern.search(text):
-        return pattern.sub(replacement, text, count=1)
-    return text.rstrip() + "\n\n" + replacement + "\n"
+    start_idx = text.find(start)
+    if start_idx == -1:
+        # Marker not found – append at the end (with newlines)
+        return text.rstrip() + "\n\n" + start + "\n" + new_block + "\n" + end + "\n"
+    end_idx = text.find(end, start_idx)
+    if end_idx == -1:
+        # Start found but no end – append after start? Better to append at end.
+        return text.rstrip() + "\n\n" + start + "\n" + new_block + "\n" + end + "\n"
+    # Replace everything between start and end (including markers)
+    before = text[:start_idx]
+    after = text[end_idx + len(end):]
+    # Reconstruct with new block
+    return before + start + "\n" + new_block + "\n" + end + after
 
 
 def scan_archive_nav() -> str:
@@ -430,7 +434,6 @@ def main() -> int:
 
     posts = fetch_posts_for_day(token, start_local, end_local)
 
-    # If there are no launches yet, do not touch files at all.
     if not posts:
         print("No launches found for today. Skipping all updates.")
         return 0
