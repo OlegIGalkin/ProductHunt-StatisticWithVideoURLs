@@ -26,10 +26,12 @@ import html
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 
 PH_ENDPOINT = "https://api.producthunt.com/v2/api/graphql"
@@ -40,6 +42,10 @@ END_TODAY = "<!-- END:PH_TODAY -->"
 
 START_ARCHIVE = "<!-- START:ARCHIVE -->"
 END_ARCHIVE = "<!-- END:ARCHIVE -->"
+
+# Rate‑limit retry settings
+MAX_RETRIES = 5
+INITIAL_BACKOFF = 2  # seconds
 
 
 # Correct GraphQL query – media list, topics as connection
@@ -80,7 +86,6 @@ def iso_z(dt: datetime) -> str:
 
 
 def md_escape_text(s: str) -> str:
-    # Escape for Markdown tables (NOT HTML).
     return (s or "").replace("\n", " ").replace("|", "\\|").strip()
 
 
@@ -93,7 +98,6 @@ def safe_link(label: str, url: str) -> str:
 
 
 def html_compact(s: str) -> str:
-    # Escape for HTML-in-Markdown, keep newlines as <br>
     s = (s or "").strip()
     if not s:
         return ""
@@ -131,23 +135,38 @@ def build_description_cell(tagline: str, description: str) -> str:
     )
 
 
-def ph_call(token: str, query: str, variables: dict) -> dict:
-    payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
-    req = Request(
-        PH_ENDPOINT,
-        data=payload,
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
-    )
-    raw = urlopen(req, timeout=45).read().decode("utf-8")
-    out = json.loads(raw)
-    if out.get("errors"):
-        raise RuntimeError(json.dumps(out["errors"], ensure_ascii=False))
-    return out.get("data") or {}
+def ph_call_with_retry(token: str, query: str, variables: dict) -> dict:
+    """Make GraphQL call with exponential backoff on 429."""
+    retries = 0
+    while True:
+        try:
+            payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+            req = Request(
+                PH_ENDPOINT,
+                data=payload,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+                method="POST",
+            )
+            raw = urlopen(req, timeout=45).read().decode("utf-8")
+            out = json.loads(raw)
+            if out.get("errors"):
+                raise RuntimeError(json.dumps(out["errors"], ensure_ascii=False))
+            return out.get("data") or {}
+        except HTTPError as e:
+            if e.code == 429 and retries < MAX_RETRIES:
+                wait = INITIAL_BACKOFF * (2 ** retries)
+                print(f"Rate limited (429). Retrying in {wait} seconds...", file=sys.stderr)
+                time.sleep(wait)
+                retries += 1
+                continue
+            raise
+        except Exception as e:
+            # Other errors propagate immediately
+            raise
 
 
 def get_target_day(tz_name: str) -> tuple[datetime, datetime, str, str, str]:
@@ -180,7 +199,7 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
             "postedAfter": iso_z(start_local),
             "postedBefore": iso_z(end_local),
         }
-        data = ph_call(token, QUERY_POSTS, vars_)
+        data = ph_call_with_retry(token, QUERY_POSTS, vars_)
         conn = (data.get("posts") or {})
         edges = conn.get("edges") or []
 
@@ -205,6 +224,9 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
         after = page.get("endCursor")
         if not after:
             break
+
+        # Small delay between pages to be kind to the API
+        time.sleep(0.5)
 
     return items
 
@@ -274,14 +296,12 @@ def render_posts_table(posts: list[dict]) -> str:
 
         website_cell = website_icon_link(p.get("website") or "")
 
-        # Video URL from media[0].videoUrl
         media = p.get("media") or []
         video_url = ""
         if media and isinstance(media, list) and len(media) > 0:
             video_url = media[0].get("videoUrl") or ""
         video_cell = safe_link("🎥 Watch", video_url) if video_url else "—"
 
-        # Categories: join topic names with semicolons
         topics = p.get("topics") or []
         topic_names = [t.get("name", "") for t in topics if isinstance(t, dict)]
         categories_cell = "; ".join(topic_names) if topic_names else "—"
@@ -303,20 +323,17 @@ def write_text(path: str, content: str) -> None:
         f.write(content)
 
 
-# FIXED: No regex, simple string search/replace – avoids escape sequence issues
 def replace_block(text: str, start: str, end: str, new_block: str) -> str:
+    """Replace content between start and end markers (inclusive)."""
     start_idx = text.find(start)
     if start_idx == -1:
-        # Marker not found – append at the end (with newlines)
+        # Append markers and new block at the end
         return text.rstrip() + "\n\n" + start + "\n" + new_block + "\n" + end + "\n"
     end_idx = text.find(end, start_idx)
     if end_idx == -1:
-        # Start found but no end – append after start? Better to append at end.
         return text.rstrip() + "\n\n" + start + "\n" + new_block + "\n" + end + "\n"
-    # Replace everything between start and end (including markers)
     before = text[:start_idx]
     after = text[end_idx + len(end):]
-    # Reconstruct with new block
     return before + start + "\n" + new_block + "\n" + end + after
 
 
