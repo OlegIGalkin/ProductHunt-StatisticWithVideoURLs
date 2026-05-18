@@ -48,7 +48,7 @@ MAX_RETRIES = 5
 INITIAL_BACKOFF = 2  # seconds
 
 
-# Correct GraphQL query – media list, topics as connection
+# GraphQL query – media list, topics as connection
 QUERY_POSTS = r"""
 query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: DateTime) {
   posts(first: $first, after: $after, postedAfter: $postedAfter, postedBefore: $postedBefore) {
@@ -114,25 +114,17 @@ def website_icon_link(website: str) -> str:
 
 
 def build_description_cell(tagline: str, description: str) -> str:
+    """
+    Returns a short description for the table cell.
+    Uses tagline, or if missing, falls back to a truncated description.
+    No "Full description" expandable section.
+    """
     short = html_compact(tagline)
-    full = html_compact(description)
-
-    if not short and not full:
-        return "—"
-
-    if not short and full:
-        short = full
+    if not short and description:
+        short = html_compact(description)
         if len(short) > 180:
             short = short[:177].rstrip() + "…"
-
-    if not full:
-        return short
-
-    return (
-        f"{short}<br>"
-        f"<details><summary><strong>Full description</strong></summary><br>"
-        f"{full}<br></details>"
-    )
+    return short if short else "—"
 
 
 def ph_call_with_retry(token: str, query: str, variables: dict) -> dict:
@@ -165,7 +157,6 @@ def ph_call_with_retry(token: str, query: str, variables: dict) -> dict:
                 continue
             raise
         except Exception as e:
-            # Other errors propagate immediately
             raise
 
 
@@ -289,6 +280,7 @@ def render_posts_table(posts: list[dict]) -> str:
         ph_url = (p.get("url") or "").strip()
         app_cell = safe_link(name, ph_url) if ph_url else name
 
+        # Description cell: only short text (no expandable details)
         desc_cell = build_description_cell(p.get("tagline") or "", p.get("description") or "")
 
         votes = int(p.get("votesCount") or 0)
