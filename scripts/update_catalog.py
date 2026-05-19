@@ -347,7 +347,8 @@ def upsert_to_turso(posts: list[dict], date_str: str) -> None:
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(video_url, time_when_added) DO UPDATE SET
             votes = excluded.votes,
-            comments = excluded.comments;
+            comments = excluded.comments,
+            categories = excluded.categories;
         """
         try:
             conn.execute(upsert_sql, (
