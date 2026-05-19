@@ -474,27 +474,7 @@ async def upsert_to_turso_async(posts: list[dict], date_str: str) -> None:
         return
 
     print(f"Connecting to Turso database at {db_url}...")
-    client = await create_client(db_url, auth_token=auth_token)
-
-    # Ensure the table exists (safe to run every time)
-    create_table_sql = """
-    CREATE TABLE IF NOT EXISTS videos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        time_when_added TEXT NOT NULL,
-        video_url TEXT NOT NULL,
-        title TEXT NOT NULL,
-        description TEXT DEFAULT '',
-        source_name TEXT DEFAULT '',
-        source_link TEXT DEFAULT '',
-        categories TEXT DEFAULT '',
-        full_description TEXT DEFAULT '',
-        votes INTEGER DEFAULT 0,
-        comments INTEGER DEFAULT 0,
-        UNIQUE (video_url, time_when_added)
-    );
-    """
-    await client.execute(create_table_sql)
-    print("Table 'videos' ready.")
+    client = create_client(db_url, auth_token=auth_token)
 
     # Prepare upsert statement
     upsert_sql = """
