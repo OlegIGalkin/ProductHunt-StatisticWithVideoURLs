@@ -39,7 +39,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install libsql
+          pip install requests
 
       - name: Update daily report + README + Turso DB
         env:

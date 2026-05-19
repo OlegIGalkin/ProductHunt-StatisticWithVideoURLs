@@ -2,29 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-Product Hunt daily catalog updater with Turso database sync (using libsql).
+Product Hunt daily catalog updater with Turso HTTP API.
 """
 
 from __future__ import annotations
 
-import asyncio
 import html
 import json
 import os
 import sys
 import time
+import requests
+import json
+import os
+from typing import List, Dict, Any
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
-
-try:
-    from libsql import Client
-    TURSO_AVAILABLE = True
-except ImportError:
-    TURSO_AVAILABLE = False
-    print("Warning: libsql not installed. Database sync disabled.", file=sys.stderr)
 
 PH_ENDPOINT = "https://api.producthunt.com/v2/api/graphql"
 README_PATH = "README.md"
@@ -298,64 +294,121 @@ def build_today_readme_block(tz_name, label, stats, posts, rel_link):
     lines = [f"### {label} ({tz_name})\n", f"- Launches with video: **{stats.launches}**", f"- Total votes: **{stats.total_votes}**", f"- Avg / Median votes: **{stats.avg_votes:.2f} / {stats.median_votes:.2f}**", f"- Total comments: **{stats.total_comments}**", f"- Avg / Median comments: **{stats.avg_comments:.2f} / {stats.median_comments:.2f}**", f"- Full report: {safe_link(label, rel_link)}\n", render_posts_table(posts)]
     return "\n".join(lines).rstrip() + "\n"
 
-async def upsert_to_turso_async(posts: list[dict], date_str: str) -> None:
-    if not TURSO_AVAILABLE:
-        print("libsql not installed. Skipping database sync.", file=sys.stderr)
-        return
+def execute_turso_pipeline(db_url: str, headers: Dict[str, str], requests_payload: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Sends a batch of operations to the /v2/pipeline endpoint.
+
+    Args:
+        db_url: The base URL of your Turso database (e.g., https://my-db.turso.io).
+        headers: The HTTP headers (including Authorization).
+        requests_payload: A list of operation dicts (as per the Turso HTTP API spec).
+
+    Returns:
+        The JSON response from the Turso API.
+    """
+    endpoint = f"{db_url}/v2/pipeline"
+    full_payload = {"requests": requests_payload}
+    response = requests.post(endpoint, headers=headers, json=full_payload)
+    response.raise_for_status()
+    return response.json()
+
+def upsert_to_turso(posts: list[dict], date_str: str) -> None:
+    """Inserts or updates records in Turso using the correct /v2/pipeline HTTP API."""
     db_url = os.getenv("TURSO_DB_URL")
     auth_token = os.getenv("TURSO_AUTH_TOKEN")
     if not db_url or not auth_token:
         print("Missing TURSO_DB_URL or TURSO_AUTH_TOKEN. Skipping database sync.", file=sys.stderr)
         return
-    print(f"Connecting to Turso database at {db_url}...")
-    client = Client(db_url, auth_token=auth_token)
-    await client.connect()
-    await client.execute("""
-        CREATE TABLE IF NOT EXISTS videos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            time_when_added TEXT NOT NULL,
-            video_url TEXT NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            source_name TEXT DEFAULT '',
-            source_link TEXT DEFAULT '',
-            categories TEXT DEFAULT '',
-            full_description TEXT DEFAULT '',
-            votes INTEGER DEFAULT 0,
-            comments INTEGER DEFAULT 0,
-            UNIQUE (video_url, time_when_added)
-        );
-    """)
-    print("Table 'videos' ready.")
-    upsert_sql = """
-        INSERT INTO videos (time_when_added, video_url, title, description, source_name, source_link, categories, full_description, votes, comments)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(video_url, time_when_added) DO UPDATE SET
-            votes = excluded.votes,
-            comments = excluded.comments;
-    """
+
+    # Normalize the database URL to the HTTPS base URL
+    # e.g., "libsql://my-db-org.turso.io" -> "https://my-db-org.turso.io"
+    if db_url.startswith("libsql://"):
+        db_url = db_url.replace("libsql://", "https://")
+    db_url = db_url.rstrip("/")
+
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json",
+    }
+
+    # Create the table if it doesn't exist
+    create_table_operations = [
+        {"type": "execute", "stmt": {"sql": """
+            CREATE TABLE IF NOT EXISTS videos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time_when_added TEXT NOT NULL,
+                video_url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                source_name TEXT DEFAULT '',
+                source_link TEXT DEFAULT '',
+                categories TEXT DEFAULT '',
+                full_description TEXT DEFAULT '',
+                votes INTEGER DEFAULT 0,
+                comments INTEGER DEFAULT 0,
+                UNIQUE (video_url, time_when_added)
+            );
+        """}},
+        {"type": "close"}
+    ]
+
+    try:
+        execute_turso_pipeline(db_url, headers, create_table_operations)
+        print("Table 'videos' ready.")
+    except Exception as e:
+        print(f"Failed to create table: {e}", file=sys.stderr)
+        return
+
+    # Prepare and execute the upsert for each post
     count = 0
     for p in posts:
         title = p.get("name") or ""
         video_url = p.get("video_url") or ""
         if not video_url:
             continue
+
         description_short = p.get("tagline") or ""
         votes = int(p.get("votesCount") or 0)
         comments = int(p.get("commentsCount") or 0)
         source_link = p.get("website") or ""
         categories_list = p.get("topics") or []
         categories_str = "; ".join([t.get("name", "") for t in categories_list if isinstance(t, dict)])
+
+        # Use the correct syntax for positional parameters in the upsert SQL
+        upsert_sql = """
+        INSERT INTO videos (time_when_added, video_url, title, description, source_name, source_link, categories, full_description, votes, comments)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(video_url, time_when_added) DO UPDATE SET
+            votes = excluded.votes,
+            comments = excluded.comments;
+        """
+        # Format args as required by the protocol, using {"type": "text", "value": ...}
+        # For integers, we MUST use the "integer" type as per the spec.
+        args = [
+            {"type": "text", "value": date_str},
+            {"type": "text", "value": video_url},
+            {"type": "text", "value": title},
+            {"type": "text", "value": description_short},
+            {"type": "text", "value": "PH"},
+            {"type": "text", "value": source_link},
+            {"type": "text", "value": categories_str},
+            {"type": "text", "value": ""},
+            {"type": "integer", "value": votes},
+            {"type": "integer", "value": comments},
+        ]
+
+        operations = [
+            {"type": "execute", "stmt": {"sql": upsert_sql, "args": args}},
+            {"type": "close"}
+        ]
+
         try:
-            await client.execute(upsert_sql, (date_str, video_url, title, description_short, "PH", source_link, categories_str, "", votes, comments))
+            execute_turso_pipeline(db_url, headers, operations)
             count += 1
         except Exception as e:
             print(f"Failed to upsert record for {title}: {e}", file=sys.stderr)
-    print(f"Upserted {count} records into Turso database.")
-    await client.close()
 
-def upsert_to_turso(posts: list[dict], date_str: str) -> None:
-    asyncio.run(upsert_to_turso_async(posts, date_str))
+    print(f"Upserted {count} records into Turso database.")
 
 def main() -> int:
     token = (os.getenv("PRODUCTHUNT_TOKEN") or "").strip()
