@@ -28,6 +28,7 @@ Env vars:
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import os
@@ -457,9 +458,9 @@ def build_today_readme_block(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def upsert_to_turso(posts: list[dict], date_str: str) -> None:
+async def upsert_to_turso_async(posts: list[dict], date_str: str) -> None:
     """
-    Insert or update records in Turso database table 'videos'.
+    Asynchronously insert or update records in Turso database table 'videos'.
     Uses ON CONFLICT on (video_url, time_when_added) to update votes/comments.
     """
     if not TURSO_AVAILABLE:
@@ -473,7 +474,7 @@ def upsert_to_turso(posts: list[dict], date_str: str) -> None:
         return
 
     print(f"Connecting to Turso database at {db_url}...")
-    client = create_client(db_url, auth_token=auth_token)
+    client = await create_client(db_url, auth_token=auth_token)
 
     # Ensure the table exists (safe to run every time)
     create_table_sql = """
@@ -492,7 +493,7 @@ def upsert_to_turso(posts: list[dict], date_str: str) -> None:
         UNIQUE (video_url, time_when_added)
     );
     """
-    client.execute(create_table_sql)
+    await client.execute(create_table_sql)
     print("Table 'videos' ready.")
 
     # Prepare upsert statement
@@ -529,7 +530,7 @@ def upsert_to_turso(posts: list[dict], date_str: str) -> None:
         categories_str = "; ".join([t.get("name", "") for t in categories_list if isinstance(t, dict)])
 
         try:
-            client.execute(
+            await client.execute(
                 upsert_sql,
                 (
                     date_str,           # time_when_added
@@ -549,7 +550,12 @@ def upsert_to_turso(posts: list[dict], date_str: str) -> None:
             print(f"Failed to upsert record for {title}: {e}", file=sys.stderr)
 
     print(f"Upserted {count} records into Turso database.")
-    client.close()
+    await client.close()
+
+
+def upsert_to_turso(posts: list[dict], date_str: str) -> None:
+    """Synchronous wrapper for async Turso upsert."""
+    asyncio.run(upsert_to_turso_async(posts, date_str))
 
 
 def main() -> int:
