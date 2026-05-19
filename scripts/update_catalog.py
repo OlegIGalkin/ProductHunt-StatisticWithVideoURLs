@@ -227,7 +227,7 @@ def render_posts_table(posts):
         video_cell = safe_link("🎥 Watch", video_url) if video_url else "—"
         topics = p.get("topics") or []
         topic_names = [t.get("name", "") for t in topics if isinstance(t, dict)]
-        categories_cell = "; ".join(topic_names) if topic_names else "—"
+        categories_cell = ", ".join(topic_names) if topic_names else "—"
         lines.append(f"| {i} | {app_cell} | {desc_cell} | {votes} | {comments} | {website_cell} | {video_cell} | {categories_cell} |")
     return "\n".join(lines) + "\n"
 
@@ -340,7 +340,7 @@ def upsert_to_turso(posts: list[dict], date_str: str) -> None:
         comments = int(p.get("commentsCount") or 0)
         source_link = p.get("website") or ""
         categories_list = p.get("topics") or []
-        categories_str = "; ".join([t.get("name", "") for t in categories_list if isinstance(t, dict)])
+        categories_str = ", ".join([t.get("name", "") for t in categories_list if isinstance(t, dict)])
 
         upsert_sql = """
         INSERT INTO videos (time_when_added, video_url, title, description, source_name, source_link, categories, full_description, votes, comments)
