@@ -2,22 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-Product Hunt daily catalog updater.
+Product Hunt daily catalog updater with Turso database sync.
 
 What it does:
 - Fetches launches for "today" via Product Hunt GraphQL.
+- Filters to keep only products that have a video URL.
 - Writes/updates a daily report file: YYYY/MM/DD-MM-YYYY.md
 - Updates README.md blocks:
-  - Today section: summary + full table (no TOP_N limit)
+  - Today section: summary + full table (only video products)
   - Archive navigation: expandable by year and month
+- Upserts the video products into a Turso SQLite database table `videos`.
 
 Important behavior:
 - If there are **0 launches with a video URL**, the script does **nothing** (no file updates).
+- Database upsert is based on (video_url, time_when_added) UNIQUE constraint.
+- If a record with same (video_url, date) exists, votes and comments are updated.
 
 Env vars:
 - PRODUCTHUNT_TOKEN (required)
 - PH_TZ (default: America/Los_Angeles)
 - DATE (optional override): YYYY-MM-DD – force a specific day in PH_TZ
+- TURSO_DB_URL (required) – e.g., "libsql://your-database.turso.io"
+- TURSO_AUTH_TOKEN (required) – Turso API token
 """
 
 from __future__ import annotations
@@ -32,6 +38,14 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+
+# Try to import Turso client
+try:
+    from libsql_client import create_client
+    TURSO_AVAILABLE = True
+except ImportError:
+    TURSO_AVAILABLE = False
+    print("Warning: libsql_client not installed. Database sync disabled.", file=sys.stderr)
 
 
 PH_ENDPOINT = "https://api.producthunt.com/v2/api/graphql"
@@ -210,6 +224,9 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
             if not video_url:
                 continue
 
+            # Store video URL in node for later use
+            node["video_url"] = video_url
+
             # Normalize topics from connection to list of dicts
             topics_conn = node.get("topics") or {}
             topic_edges = topics_conn.get("edges") or []
@@ -300,10 +317,7 @@ def render_posts_table(posts: list[dict]) -> str:
         website_cell = website_icon_link(p.get("website") or "")
 
         # Video URL (already guaranteed to exist because we filtered earlier)
-        media = p.get("media") or []
-        video_url = ""
-        if media and isinstance(media, list) and len(media) > 0:
-            video_url = media[0].get("videoUrl") or ""
+        video_url = p.get("video_url", "")
         video_cell = safe_link("🎥 Watch", video_url) if video_url else "—"
 
         topics = p.get("topics") or []
@@ -443,6 +457,101 @@ def build_today_readme_block(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def upsert_to_turso(posts: list[dict], date_str: str) -> None:
+    """
+    Insert or update records in Turso database table 'videos'.
+    Uses ON CONFLICT on (video_url, time_when_added) to update votes/comments.
+    """
+    if not TURSO_AVAILABLE:
+        print("Turso client not installed. Skipping database sync.", file=sys.stderr)
+        return
+
+    db_url = os.getenv("TURSO_DB_URL")
+    auth_token = os.getenv("TURSO_AUTH_TOKEN")
+    if not db_url or not auth_token:
+        print("Missing TURSO_DB_URL or TURSO_AUTH_TOKEN. Skipping database sync.", file=sys.stderr)
+        return
+
+    print(f"Connecting to Turso database at {db_url}...")
+    client = create_client(db_url, auth_token=auth_token)
+
+    # Ensure the table exists (safe to run every time)
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS videos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        time_when_added TEXT NOT NULL,
+        video_url TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        source_name TEXT DEFAULT '',
+        source_link TEXT DEFAULT '',
+        categories TEXT DEFAULT '',
+        full_description TEXT DEFAULT '',
+        votes INTEGER DEFAULT 0,
+        comments INTEGER DEFAULT 0,
+        UNIQUE (video_url, time_when_added)
+    );
+    """
+    client.execute(create_table_sql)
+    print("Table 'videos' ready.")
+
+    # Prepare upsert statement
+    upsert_sql = """
+    INSERT INTO videos (
+        time_when_added,
+        video_url,
+        title,
+        description,
+        source_name,
+        source_link,
+        categories,
+        full_description,
+        votes,
+        comments
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(video_url, time_when_added) DO UPDATE SET
+        votes = excluded.votes,
+        comments = excluded.comments;
+    """
+
+    count = 0
+    for p in posts:
+        title = p.get("name") or ""
+        video_url = p.get("video_url") or ""
+        if not video_url:
+            continue  # skip (should not happen, but safety)
+
+        description_short = p.get("tagline") or ""
+        votes = int(p.get("votesCount") or 0)
+        comments = int(p.get("commentsCount") or 0)
+        source_link = p.get("website") or ""
+        categories_list = p.get("topics") or []
+        categories_str = "; ".join([t.get("name", "") for t in categories_list if isinstance(t, dict)])
+
+        try:
+            client.execute(
+                upsert_sql,
+                (
+                    date_str,           # time_when_added
+                    video_url,          # video_url
+                    title,              # title
+                    description_short,  # description
+                    "PH",               # source_name
+                    source_link,        # source_link
+                    categories_str,     # categories
+                    "",                 # full_description (empty)
+                    votes,              # votes
+                    comments,           # comments
+                )
+            )
+            count += 1
+        except Exception as e:
+            print(f"Failed to upsert record for {title}: {e}", file=sys.stderr)
+
+    print(f"Upserted {count} records into Turso database.")
+    client.close()
+
+
 def main() -> int:
     token = (os.getenv("PRODUCTHUNT_TOKEN") or "").strip()
     if not token:
@@ -461,6 +570,11 @@ def main() -> int:
         print("No launches with video found for today. Skipping all updates.")
         return 0
 
+    # === Turso Database Upsert ===
+    date_str = start_local.strftime("%Y-%m-%d")  # America/Los_Angeles date without time
+    upsert_to_turso(posts, date_str)
+
+    # === Continue with local report generation ===
     stats = compute_daily_stats(posts)
 
     daily_filename = f"{label}.md"

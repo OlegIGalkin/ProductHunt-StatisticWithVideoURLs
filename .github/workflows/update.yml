@@ -37,10 +37,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Update daily report + README
+      - name: Install dependencies
+        run: |
+          pip install libsql-client
+
+      - name: Update daily report + README + Turso DB
         env:
           PRODUCTHUNT_TOKEN: ${{ secrets.PRODUCTHUNT_TOKEN }}
           PH_TZ: "America/Los_Angeles"
+          TURSO_DB_URL: ${{ secrets.TURSO_DB_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
         run: |
           python3 scripts/update_catalog.py
 
