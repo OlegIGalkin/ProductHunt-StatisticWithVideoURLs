@@ -12,7 +12,7 @@ What it does:
   - Archive navigation: expandable by year and month
 
 Important behavior:
-- If there are **0 launches** for the selected day, the script does **nothing** (no file updates).
+- If there are **0 launches with a video URL**, the script does **nothing** (no file updates).
 
 Env vars:
 - PRODUCTHUNT_TOKEN (required)
@@ -114,11 +114,7 @@ def website_icon_link(website: str) -> str:
 
 
 def build_description_cell(tagline: str, description: str) -> str:
-    """
-    Returns a short description for the table cell.
-    Uses tagline, or if missing, falls back to a truncated description.
-    No "Full description" expandable section.
-    """
+    """Returns a short description for the table cell (tagline or truncated description)."""
     short = html_compact(tagline)
     if not short and description:
         short = html_compact(description)
@@ -180,8 +176,9 @@ def get_target_day(tz_name: str) -> tuple[datetime, datetime, str, str, str]:
 
 
 def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) -> list[dict]:
+    """Fetch all posts for the day and return only those that have a video URL."""
     after = None
-    items: list[dict] = []
+    all_items: list[dict] = []
 
     while True:
         vars_ = {
@@ -196,18 +193,33 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
 
         for e in edges:
             node = (e or {}).get("node")
-            if node:
-                if "media" not in node or node["media"] is None:
-                    node["media"] = []
-                # Normalize topics from connection to list of dicts
-                topics_conn = node.get("topics") or {}
-                topic_edges = topics_conn.get("edges") or []
-                node["topics"] = []
-                for te in topic_edges:
-                    topic_node = te.get("node")
-                    if topic_node and topic_node.get("name"):
-                        node["topics"].append({"name": topic_node["name"]})
-                items.append(node)
+            if not node:
+                continue
+
+            # Normalize media field (ensure list)
+            if "media" not in node or node["media"] is None:
+                node["media"] = []
+
+            # Check for video URL
+            video_url = ""
+            media = node.get("media", [])
+            if media and isinstance(media, list) and len(media) > 0:
+                video_url = media[0].get("videoUrl") or ""
+
+            # If no video URL, skip this post entirely
+            if not video_url:
+                continue
+
+            # Normalize topics from connection to list of dicts
+            topics_conn = node.get("topics") or {}
+            topic_edges = topics_conn.get("edges") or []
+            node["topics"] = []
+            for te in topic_edges:
+                topic_node = te.get("node")
+                if topic_node and topic_node.get("name"):
+                    node["topics"].append({"name": topic_node["name"]})
+
+            all_items.append(node)
 
         page = conn.get("pageInfo") or {}
         if not page.get("hasNextPage"):
@@ -219,7 +231,7 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
         # Small delay between pages to be kind to the API
         time.sleep(0.5)
 
-    return items
+    return all_items
 
 
 @dataclass
@@ -280,7 +292,6 @@ def render_posts_table(posts: list[dict]) -> str:
         ph_url = (p.get("url") or "").strip()
         app_cell = safe_link(name, ph_url) if ph_url else name
 
-        # Description cell: only short text (no expandable details)
         desc_cell = build_description_cell(p.get("tagline") or "", p.get("description") or "")
 
         votes = int(p.get("votesCount") or 0)
@@ -288,6 +299,7 @@ def render_posts_table(posts: list[dict]) -> str:
 
         website_cell = website_icon_link(p.get("website") or "")
 
+        # Video URL (already guaranteed to exist because we filtered earlier)
         media = p.get("media") or []
         video_url = ""
         if media and isinstance(media, list) and len(media) > 0:
@@ -391,13 +403,13 @@ def build_daily_report_md(
     posts: list[dict],
     rel_link_to_today: str,
 ) -> str:
-    header = f"# Product Hunt — launches for {label_dd_mm_yyyy}\n"
+    header = f"# Product Hunt — video launches for {label_dd_mm_yyyy}\n"
     sub = f"_Timezone for “today”: `{tz_name}`. Source: Product Hunt API._\n\n"
     follow_me = "[![Follow me on Product Hunt](https://img.shields.io/badge/Follow%20me%20on%20Product%20Hunt-@nbox-orange?style=for-the-badge)](https://www.producthunt.com/@nbox)\n\n"
 
     summary = []
     summary.append("## Summary\n")
-    summary.append(f"- Launches: **{stats.launches}**")
+    summary.append(f"- Launches with video: **{stats.launches}**")
     summary.append(f"- Total votes: **{stats.total_votes}**")
     summary.append(f"- Avg / Median votes: **{stats.avg_votes:.2f} / {stats.median_votes:.2f}**")
     summary.append(f"- Total comments: **{stats.total_comments}**")
@@ -406,7 +418,7 @@ def build_daily_report_md(
     summary.append("\n")
 
     launches = []
-    launches.append("## Launches (sorted by votes)\n")
+    launches.append("## Launches with video (sorted by votes)\n")
     launches.append(render_posts_table(posts))
 
     return header + follow_me + "\n".join(summary) + "\n" + "\n".join(launches)
@@ -421,7 +433,7 @@ def build_today_readme_block(
 ) -> str:
     lines: list[str] = []
     lines.append(f"### {label_dd_mm_yyyy} ({tz_name})\n")
-    lines.append(f"- Launches: **{stats.launches}**")
+    lines.append(f"- Launches with video: **{stats.launches}**")
     lines.append(f"- Total votes: **{stats.total_votes}**")
     lines.append(f"- Avg / Median votes: **{stats.avg_votes:.2f} / {stats.median_votes:.2f}**")
     lines.append(f"- Total comments: **{stats.total_comments}**")
@@ -441,10 +453,12 @@ def main() -> int:
 
     start_local, end_local, label, year, month = get_target_day(tz_name)
 
+    # Fetch only posts that have a video URL (filtering happens inside fetch_posts_for_day)
     posts = fetch_posts_for_day(token, start_local, end_local)
 
+    # If no posts with video, skip all updates
     if not posts:
-        print("No launches found for today. Skipping all updates.")
+        print("No launches with video found for today. Skipping all updates.")
         return 0
 
     stats = compute_daily_stats(posts)
