@@ -2,67 +2,138 @@ name: Update Product Hunt catalog
 
 on:
   workflow_dispatch:
+    inputs:
+      date:
+        description: "Optional: override target date (YYYY-MM-DD, LA timezone). Leave empty for today."
+        required: false
+        default: ""
   schedule:
-    # GitHub cron runs in UTC.
-    # Default timezone used by the script: America/Los_Angeles
+    # GitHub cron runs in UTC. The script itself uses America/Los_Angeles.
     #
-    # Runs:
-    # - Start of PH day (00:05 LA)
-    # - Midday (12:00 LA)
-    # - 10 minutes before end of day (23:50 LA)
+    # Each intended LA-local slot has TWO crons — one that lands correctly
+    # during PST and one that lands correctly during PDT. The "wrong" one
+    # for the current DST season is skipped by the `guard` step below, so
+    # only 3 runs actually happen per day.
     #
-    # Two entries each to cover DST shifts.
-    # 00:05 LA -> 08:05 UTC (winter), 07:05 UTC (summer)
+    # 00:05 LA  -> 07:05 UTC (PDT) / 08:05 UTC (PST)
     - cron: "5 7 * * *"
     - cron: "5 8 * * *"
-    # 12:00 LA -> 20:00 UTC (winter), 19:00 UTC (summer)
+    # 12:00 LA  -> 19:00 UTC (PDT) / 20:00 UTC (PST)
     - cron: "0 19 * * *"
     - cron: "0 20 * * *"
-    # 23:50 LA -> 07:50 UTC (winter), 06:50 UTC (summer)
+    # 23:50 LA  -> 06:50 UTC (PDT) / 07:50 UTC (PST)
     - cron: "50 6 * * *"
     - cron: "50 7 * * *"
 
 permissions:
   contents: write
 
+# ---------------------------------------------------------------------------
+# CRITICAL: the PH token is shared across every run of this workflow. Two
+# concurrent runs fetch from the same 450 req / 15 min bucket and quickly
+# trip a 429 that neither can recover from. This lock serialises runs.
+# ---------------------------------------------------------------------------
+concurrency:
+  group: producthunt-catalog-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
+    # Bound the job so a hung run can't sit on the concurrency lock forever.
+    timeout-minutes: 15
+
     steps:
+      # ---------------------------------------------------------------------
+      # Skip DST-mismatched cron firings. Only fires for `schedule` events;
+      # `workflow_dispatch` always proceeds.
+      #
+      # Tolerance is 10 min, which is comfortably less than the 45–60 min
+      # gap between the intended slot and any of the "wrong" crons, but
+      # still forgiving of GitHub's cron delay under load.
+      # ---------------------------------------------------------------------
+      - name: Guard — run only at intended LA local times
+        id: guard
+        if: github.event_name == 'schedule'
+        shell: bash
+        env:
+          PH_TZ: "America/Los_Angeles"
+        run: |
+          python3 - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          now = datetime.now(ZoneInfo(os.environ["PH_TZ"]))
+          targets = [(0, 5), (12, 0), (23, 50)]  # LA local hours/minutes
+          tol = 10  # minutes
+          ok = any(now.hour == h and abs(now.minute - m) <= tol for h, m in targets)
+          print(f"LA local time = {now:%Y-%m-%d %H:%M}  ->  {'run' if ok else 'skip'}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"run={'yes' if ok else 'no'}\n")
+          PY
+
       - name: Checkout
+        if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         uses: actions/checkout@v4
+        with:
+          # Full history so `git pull --rebase` on push is reliable.
+          fetch-depth: 0
 
       - name: Setup Python
+        if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: |
-          pip install libsql
+        if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
+        run: pip install libsql
 
       - name: Update daily report + README + Turso DB
+        if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         env:
           PRODUCTHUNT_TOKEN: ${{ secrets.PRODUCTHUNT_TOKEN }}
           PH_TZ: "America/Los_Angeles"
           TURSO_DB_URL: ${{ secrets.TURSO_DB_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-        run: |
-          python3 scripts/update_catalog.py
+          # Empty for schedule runs -> script falls back to "today".
+          DATE: ${{ github.event.inputs.date }}
+        run: python3 scripts/update_catalog.py
 
       - name: Commit & push (if changed)
+        if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         shell: bash
         run: |
-          if git diff --quiet; then
+          set -euo pipefail
+
+          # `git status --porcelain` also catches untracked files (e.g. a new
+          # YYYY/MM directory the script just created), which `git diff`
+          # would miss.
+          if [ -z "$(git status --porcelain)" ]; then
             echo "No changes."
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add README.md
-          git add */*/*.md
+          # `git add -A` picks up README.md and any new YYYY/MM/*.md files.
+          git add -A
 
           git commit -m "chore: update Product Hunt daily stats"
-          git push
+
+          # A concurrent run or a human push may have landed since checkout.
+          # Rebase and retry so we don't fail on a non-fast-forward.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Push succeeded on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push failed on attempt ${attempt}; rebasing and retrying..."
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            sleep $((attempt * 5))
+          done
+
+          echo "Push failed after multiple attempts." >&2
+          exit 1
