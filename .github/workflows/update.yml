@@ -28,11 +28,8 @@ on:
 permissions:
   contents: write
 
-# ---------------------------------------------------------------------------
-# CRITICAL: the PH token is shared across every run of this workflow. Two
-# concurrent runs fetch from the same 450 req / 15 min bucket and quickly
-# trip a 429 that neither can recover from. This lock serialises runs.
-# ---------------------------------------------------------------------------
+# Serialise runs so two of them never race for the same PRODUCTHUNT_TOKEN
+# bucket, and so two concurrent pushes can't collide on the branch.
 concurrency:
   group: producthunt-catalog-${{ github.ref }}
   cancel-in-progress: false
@@ -40,17 +37,12 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    # Bound the job so a hung run can't sit on the concurrency lock forever.
     timeout-minutes: 15
 
     steps:
       # ---------------------------------------------------------------------
       # Skip DST-mismatched cron firings. Only fires for `schedule` events;
       # `workflow_dispatch` always proceeds.
-      #
-      # Tolerance is 10 min, which is comfortably less than the 45–60 min
-      # gap between the intended slot and any of the "wrong" crons, but
-      # still forgiving of GitHub's cron delay under load.
       # ---------------------------------------------------------------------
       - name: Guard — run only at intended LA local times
         id: guard
@@ -65,8 +57,8 @@ jobs:
           from zoneinfo import ZoneInfo
 
           now = datetime.now(ZoneInfo(os.environ["PH_TZ"]))
-          targets = [(0, 5), (12, 0), (23, 50)]  # LA local hours/minutes
-          tol = 10  # minutes
+          targets = [(0, 5), (12, 0), (23, 50)]
+          tol = 10
           ok = any(now.hour == h and abs(now.minute - m) <= tol for h, m in targets)
           print(f"LA local time = {now:%Y-%m-%d %H:%M}  ->  {'run' if ok else 'skip'}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
@@ -77,8 +69,11 @@ jobs:
         if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         uses: actions/checkout@v4
         with:
-          # Full history so `git pull --rebase` on push is reliable.
+          # Full history so rebase against origin works.
           fetch-depth: 0
+          # Keep the credentials the checkout step installs around for our
+          # own git commands below.
+          persist-credentials: true
 
       - name: Setup Python
         if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
@@ -97,43 +92,82 @@ jobs:
           PH_TZ: "America/Los_Angeles"
           TURSO_DB_URL: ${{ secrets.TURSO_DB_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-          # Empty for schedule runs -> script falls back to "today".
           DATE: ${{ github.event.inputs.date }}
         run: python3 scripts/update_catalog.py
 
+      # ---------------------------------------------------------------------
+      # Commit & push. Handles three failure modes:
+      #   1. Someone else pushed between checkout and push  -> fetch + rebase + retry.
+      #   2. Detached HEAD on scheduled runs                -> reattach to branch.
+      #   3. Rebase conflict (rare)                         -> abort, retry fresh.
+      # ---------------------------------------------------------------------
       - name: Commit & push (if changed)
         if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         shell: bash
         run: |
           set -euo pipefail
 
-          # `git status --porcelain` also catches untracked files (e.g. a new
-          # YYYY/MM directory the script just created), which `git diff`
-          # would miss.
           if [ -z "$(git status --porcelain)" ]; then
             echo "No changes."
             exit 0
           fi
 
+          # ---- Resolve the target branch reliably -----------------------
+          BRANCH="${GITHUB_REF_NAME:-}"
+          if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
+            BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          fi
+          if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
+            # Fall back to the repo default branch.
+            BRANCH="$(git remote show origin | awk '/HEAD branch/ {print $NF}')"
+          fi
+          echo "Target branch: ${BRANCH}"
+
+          # Reattach if checkout left us in detached HEAD.
+          CURRENT_HEAD="$(git rev-parse --abbrev-ref HEAD)"
+          if [ "$CURRENT_HEAD" = "HEAD" ]; then
+            git checkout -B "$BRANCH"
+          fi
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config pull.rebase    true
+          git config rebase.autoStash true
 
-          # `git add -A` picks up README.md and any new YYYY/MM/*.md files.
           git add -A
-
           git commit -m "chore: update Product Hunt daily stats"
 
-          # A concurrent run or a human push may have landed since checkout.
-          # Rebase and retry so we don't fail on a non-fast-forward.
-          for attempt in 1 2 3 4 5; do
-            if git push; then
+          MAX_ATTEMPTS=5
+          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
+            echo "── Push attempt ${attempt}/${MAX_ATTEMPTS} ──"
+
+            # Make sure the remote tracking ref is fresh before rebasing.
+            if ! git fetch origin "$BRANCH"; then
+              echo "Fetch failed; sleeping and retrying."
+              sleep $((attempt * 5))
+              continue
+            fi
+
+            # Rebase local commit(s) onto the latest remote state.
+            if ! git rebase "origin/${BRANCH}"; then
+              if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+                echo "Rebase conflict; aborting rebase."
+                git rebase --abort || true
+              fi
+              echo "Rebase failed on attempt ${attempt}; sleeping and retrying."
+              sleep $((attempt * 5))
+              continue
+            fi
+
+            # Fast-forward push.
+            if git push origin "HEAD:${BRANCH}"; then
               echo "Push succeeded on attempt ${attempt}."
               exit 0
             fi
-            echo "Push failed on attempt ${attempt}; rebasing and retrying..."
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+
+            echo "Push rejected on attempt ${attempt}; refetching and retrying."
             sleep $((attempt * 5))
           done
 
-          echo "Push failed after multiple attempts." >&2
+          echo "Push failed after ${MAX_ATTEMPTS} attempts." >&2
           exit 1
