@@ -8,22 +8,20 @@ on:
         required: false
         default: ""
   schedule:
-    # GitHub cron runs in UTC. The script itself uses America/Los_Angeles.
+    # GitHub cron runs in UTC. The script interprets "today" via PH_TZ.
     #
-    # Each intended LA-local slot has TWO crons — one that lands correctly
-    # during PST and one that lands correctly during PDT. The "wrong" one
-    # for the current DST season is skipped by the `guard` step below, so
-    # only 3 runs actually happen per day.
+    # Each cron below lands near its intended LA-local slot in BOTH PST and
+    # PDT (see table in the PR/commit message). This removes the need for a
+    # DST guard step entirely — which was fragile because GitHub's cron
+    # delivery can be delayed by hours, and any wall-clock check would then
+    # skip a valid run.
     #
-    # 00:05 LA  -> 07:05 UTC (PDT) / 08:05 UTC (PST)
-    - cron: "5 7 * * *"
-    - cron: "5 8 * * *"
-    # 12:00 LA  -> 19:00 UTC (PDT) / 20:00 UTC (PST)
-    - cron: "0 19 * * *"
-    - cron: "0 20 * * *"
-    # 23:50 LA  -> 06:50 UTC (PDT) / 07:50 UTC (PST)
+    # End of LA day  (~22:50 PST / 23:50 PDT)
     - cron: "50 6 * * *"
-    - cron: "50 7 * * *"
+    # Start of LA day (~00:05 PST / 01:05 PDT)
+    - cron: "5 8 * * *"
+    # Midday LA       (~12:00 PST / 13:00 PDT)
+    - cron: "0 20 * * *"
 
 permissions:
   contents: write
@@ -40,53 +38,22 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      # ---------------------------------------------------------------------
-      # Skip DST-mismatched cron firings. Only fires for `schedule` events;
-      # `workflow_dispatch` always proceeds.
-      # ---------------------------------------------------------------------
-      - name: Guard — run only at intended LA local times
-        id: guard
-        if: github.event_name == 'schedule'
-        shell: bash
-        env:
-          PH_TZ: "America/Los_Angeles"
-        run: |
-          python3 - <<'PY'
-          import os
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-
-          now = datetime.now(ZoneInfo(os.environ["PH_TZ"]))
-          targets = [(0, 5), (12, 0), (23, 50)]
-          tol = 10
-          ok = any(now.hour == h and abs(now.minute - m) <= tol for h, m in targets)
-          print(f"LA local time = {now:%Y-%m-%d %H:%M}  ->  {'run' if ok else 'skip'}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"run={'yes' if ok else 'no'}\n")
-          PY
-
       - name: Checkout
-        if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         uses: actions/checkout@v4
         with:
-          # Full history so rebase against origin works.
+          # Full history so `git rebase origin/<branch>` works after a race.
           fetch-depth: 0
-          # Keep the credentials the checkout step installs around for our
-          # own git commands below.
           persist-credentials: true
 
       - name: Setup Python
-        if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         run: pip install libsql
 
       - name: Update daily report + README + Turso DB
-        if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         env:
           PRODUCTHUNT_TOKEN: ${{ secrets.PRODUCTHUNT_TOKEN }}
           PH_TZ: "America/Los_Angeles"
@@ -95,14 +62,7 @@ jobs:
           DATE: ${{ github.event.inputs.date }}
         run: python3 scripts/update_catalog.py
 
-      # ---------------------------------------------------------------------
-      # Commit & push. Handles three failure modes:
-      #   1. Someone else pushed between checkout and push  -> fetch + rebase + retry.
-      #   2. Detached HEAD on scheduled runs                -> reattach to branch.
-      #   3. Rebase conflict (rare)                         -> abort, retry fresh.
-      # ---------------------------------------------------------------------
       - name: Commit & push (if changed)
-        if: github.event_name != 'schedule' || steps.guard.outputs.run == 'yes'
         shell: bash
         run: |
           set -euo pipefail
@@ -118,12 +78,10 @@ jobs:
             BRANCH="$(git rev-parse --abbrev-ref HEAD)"
           fi
           if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
-            # Fall back to the repo default branch.
             BRANCH="$(git remote show origin | awk '/HEAD branch/ {print $NF}')"
           fi
           echo "Target branch: ${BRANCH}"
 
-          # Reattach if checkout left us in detached HEAD.
           CURRENT_HEAD="$(git rev-parse --abbrev-ref HEAD)"
           if [ "$CURRENT_HEAD" = "HEAD" ]; then
             git checkout -B "$BRANCH"
@@ -141,14 +99,12 @@ jobs:
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
             echo "── Push attempt ${attempt}/${MAX_ATTEMPTS} ──"
 
-            # Make sure the remote tracking ref is fresh before rebasing.
             if ! git fetch origin "$BRANCH"; then
               echo "Fetch failed; sleeping and retrying."
               sleep $((attempt * 5))
               continue
             fi
 
-            # Rebase local commit(s) onto the latest remote state.
             if ! git rebase "origin/${BRANCH}"; then
               if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
                 echo "Rebase conflict; aborting rebase."
@@ -159,7 +115,6 @@ jobs:
               continue
             fi
 
-            # Fast-forward push.
             if git push origin "HEAD:${BRANCH}"; then
               echo "Push succeeded on attempt ${attempt}."
               exit 0
