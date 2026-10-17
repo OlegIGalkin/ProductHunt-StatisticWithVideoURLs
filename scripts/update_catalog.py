@@ -562,7 +562,10 @@ def upsert_to_turso(posts: list[dict], date_str: str) -> None:
         description_short = p.get("tagline") or ""
         votes = int(p.get("votesCount") or 0)
         comments = int(p.get("commentsCount") or 0)
-        source_link = p.get("website") or ""
+        # `p["url"]` is the Product Hunt product page.
+        # `p["website"]` is the PH redirect to the product's own site
+        # (https://www.producthunt.com/r/...?utm_...). Use `url` here.
+        source_link = p.get("url") or ""
         categories_list = p.get("topics") or []
         categories_str = ", ".join(
             t.get("name", "") for t in categories_list if isinstance(t, dict)
