@@ -96,6 +96,9 @@ def _throttle() -> None:
 
 
 # --- GraphQL query ----------------------------------------------------------
+# Only fields that are actually persisted to the `videos` table (or, for
+# `website`, rendered into the README) are requested. `id`, `slug`, and
+# `description` are intentionally omitted to reduce complexity cost.
 
 QUERY_POSTS = r"""
 query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: DateTime) {
@@ -103,11 +106,8 @@ query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: 
     pageInfo { hasNextPage endCursor }
     edges {
       node {
-        id
-        slug
         name
         tagline
-        description
         url
         website
         votesCount
@@ -153,12 +153,8 @@ def website_icon_link(website: str) -> str:
     return f"[🔗](<{w}>)"
 
 
-def build_description_cell(tagline: str, description: str) -> str:
+def build_description_cell(tagline: str) -> str:
     short = html_compact(tagline)
-    if not short and description:
-        short = html_compact(description)
-        if len(short) > 180:
-            short = short[:177].rstrip() + "…"
     return short if short else "—"
 
 
@@ -387,7 +383,7 @@ def render_posts_table(posts):
         name = md_escape_text(p.get("name") or "")
         ph_url = (p.get("url") or "").strip()
         app_cell = safe_link(name, ph_url) if ph_url else name
-        desc_cell = build_description_cell(p.get("tagline") or "", p.get("description") or "")
+        desc_cell = build_description_cell(p.get("tagline") or "")
         votes = int(p.get("votesCount") or 0)
         comments = int(p.get("commentsCount") or 0)
         website_cell = website_icon_link(p.get("website") or "")
