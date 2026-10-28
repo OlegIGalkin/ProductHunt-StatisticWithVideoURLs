@@ -35,17 +35,27 @@ END_ARCHIVE = "<!-- END:ARCHIVE -->"
 
 MAX_RETRIES = 8
 
-# If a 429's reset hint tells us to wait longer than this, treat it as
-# "quota exhausted for this run" and fail fast so the next scheduled run
-# can pick it up. Product Hunt's 15-minute window resets in ~900s at most,
-# and the CI job has timeout-minutes: 15, so anything at/above ~14 min is
-# not worth blocking on.
-RETRY_AFTER_FAIL_THRESHOLD = int(os.getenv("PH_RETRY_AFTER_FAIL_THRESHOLD", "840"))
+# Product Hunt's rate-limit window is 15 minutes = 900s. Allow waiting for
+# the full window rather than failing at 840s. Combined with the workflow's
+# timeout-minutes=30, this lets a single 429 wait out the window and resume
+# pagination from the last cursor.
+RETRY_AFTER_FAIL_THRESHOLD = int(os.getenv("PH_RETRY_AFTER_FAIL_THRESHOLD", "900"))
+
+# Cap total accumulated sleep inside one ph_call_with_retry invocation.
+# Guards against a pathological loop that repeatedly trips 429 with a full
+# 900s reset, which would otherwise keep the job alive for hours.
+MAX_TOTAL_WAIT_SECONDS = int(os.getenv("PH_MAX_TOTAL_WAIT_SECONDS", "900"))
+
+# Cap on how many pagination pages fetch_posts_for_day will ever request.
+# Prevents an infinite loop if PH ever returns hasNextPage=true with a
+# non-advancing cursor. 200 pages × 50 posts = 10 000 posts, well above any
+# realistic day; exceeding it is a bug signal, not a legitimate day size.
+MAX_PAGES = int(os.getenv("PH_MAX_PAGES", "200"))
 
 # Client-side sliding window for request spacing. The 450/15min request
 # budget applies to non-GraphQL endpoints; the /graphql endpoint is bounded
-# by complexity instead (see the docstring on ph_call_with_retry). We still
-# enforce a minimum spacing to keep bursts tame on CI runners.
+# by complexity instead (see ph_call_with_retry docstring). We still enforce
+# a minimum spacing to keep bursts tame on CI runners.
 REQUEST_BUDGET_WINDOW = 15 * 60  # seconds
 REQUEST_BUDGET_MAX = int(os.getenv("PH_REQUEST_BUDGET_MAX", "400"))
 MIN_REQUEST_INTERVAL = float(os.getenv("PH_MIN_REQUEST_INTERVAL", "0.6"))
@@ -63,18 +73,15 @@ def _throttle() -> None:
     with _request_lock:
         now = time.monotonic()
 
-        # Ensure a minimum gap between consecutive requests.
         since_last = now - _last_request_at
         if since_last < MIN_REQUEST_INTERVAL:
             time.sleep(MIN_REQUEST_INTERVAL - since_last)
             now = time.monotonic()
 
-        # Drop timestamps that fell outside the rolling window.
         cutoff = now - REQUEST_BUDGET_WINDOW
         while _request_times and _request_times[0] < cutoff:
             _request_times.pop(0)
 
-        # If we're at the client-side budget, wait for the oldest to age out.
         if len(_request_times) >= REQUEST_BUDGET_MAX:
             sleep_for = _request_times[0] + REQUEST_BUDGET_WINDOW - now + 0.5
             if sleep_for > 0:
@@ -95,9 +102,10 @@ def _throttle() -> None:
 
 
 # --- GraphQL query ----------------------------------------------------------
-# Only fields that are actually persisted to the `videos` table (or, for
-# `website`, rendered into the README) are requested. `id`, `slug`, and
-# `description` are intentionally omitted to reduce complexity cost.
+# `topics(first: 5)` caps the nested topic connection per post, which is the
+# dominant complexity cost after the base per-page charge. Posts with >5
+# topics keep their first 5 categories in the catalog — a deliberate trade
+# to fit a busy day inside one 6250-point window.
 
 QUERY_POSTS = r"""
 query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: DateTime) {
@@ -112,7 +120,7 @@ query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: 
         votesCount
         commentsCount
         media { videoUrl }
-        topics { edges { node { name } } }
+        topics(first: 5) { edges { node { name } } }
       }
     }
   }
@@ -170,18 +178,13 @@ _RATE_HEADERS = (
 
 
 def _header_int(headers, name: str) -> int | None:
-    """Return a header value as int, or None if absent / non-numeric.
-
-    Python's http.client HTTPMessage is case-insensitive for `.get()`, so
-    header name casing here is for readability only.
-    """
+    """Return a header value as int, or None if absent / non-numeric."""
     if headers is None:
         return None
     raw = headers.get(name)
     if raw is None:
         return None
     try:
-        # PH occasionally emits "850.0" — accept floats that look like ints.
         return int(float(raw))
     except (ValueError, TypeError):
         return None
@@ -210,10 +213,13 @@ def ph_call_with_retry(token: str, query: str, variables: dict) -> dict:
     - Falls back to exponential backoff only if neither header is present.
     - Fails fast if the required wait exceeds RETRY_AFTER_FAIL_THRESHOLD
       (indicates the next scheduled run should pick this up instead).
+    - Caps total accumulated wait at MAX_TOTAL_WAIT_SECONDS so a pathologically
+      rate-limited run can't hang the job for hours.
     - Retries transient 5xx responses and URLError / timeouts.
     - Applies a client-side sliding-window budget before every request.
     """
     last_exc: Exception | None = None
+    total_waited = 0.0
 
     for attempt in range(MAX_RETRIES):
         _throttle()
@@ -257,12 +263,12 @@ def ph_call_with_retry(token: str, query: str, variables: dict) -> dict:
                     delay = min(60.0 * (2 ** attempt), 900.0)
                     hint = "exponential fallback"
 
-                # Jitter avoids two runs colliding on the same reset instant.
                 delay += random.uniform(1, 5)
 
                 print(
                     f"Rate limited (429). attempt={attempt + 1}/{MAX_RETRIES} "
-                    f"source={hint} sleeping {delay:.1f}s",
+                    f"source={hint} sleeping {delay:.1f}s "
+                    f"(total_waited={total_waited:.0f}s)",
                     file=sys.stderr,
                 )
 
@@ -276,9 +282,19 @@ def ph_call_with_retry(token: str, query: str, variables: dict) -> dict:
                     )
                     raise
 
+                if total_waited + delay > MAX_TOTAL_WAIT_SECONDS:
+                    print(
+                        f"Total wait would reach {total_waited + delay:.0f}s, "
+                        f"exceeding PH_MAX_TOTAL_WAIT_SECONDS="
+                        f"{MAX_TOTAL_WAIT_SECONDS}s — giving up.",
+                        file=sys.stderr,
+                    )
+                    raise
+
                 if attempt == MAX_RETRIES - 1:
                     raise
                 time.sleep(delay)
+                total_waited += delay
                 continue
 
             if 500 <= e.code < 600 and attempt < MAX_RETRIES - 1:
@@ -328,9 +344,27 @@ def get_target_day(tz_name: str):
 
 
 def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) -> list[dict]:
+    """Paginate `posts` for the given local day.
+
+    Emits one log line per page so the size of the day's post set is visible
+    in the CI log. Guards against non-advancing cursors and runaway page
+    counts, both of which would otherwise look identical to a "really big
+    day" until the rate limit trips.
+    """
     after = None
-    items = []
+    items: list[dict] = []
+    pages = 0
+    seen_cursors: set[str] = set()
+
     while True:
+        pages += 1
+        if pages > MAX_PAGES:
+            print(
+                f"WARNING: exceeded MAX_PAGES={MAX_PAGES}; truncating results.",
+                file=sys.stderr,
+            )
+            break
+
         vars_ = {
             "first": 50,
             "after": after,
@@ -340,6 +374,7 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
         data = ph_call_with_retry(token, QUERY_POSTS, vars_)
         conn = data.get("posts") or {}
         edges = conn.get("edges") or []
+
         for e in edges:
             node = e.get("node")
             if not node:
@@ -361,14 +396,45 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
                 if tn and tn.get("name"):
                     node["topics"].append({"name": tn["name"]})
             items.append(node)
+
         page = conn.get("pageInfo") or {}
-        if not page.get("hasNextPage"):
+        has_next = bool(page.get("hasNextPage"))
+        print(
+            f"[page {pages}] edges={len(edges)} kept_total={len(items)} "
+            f"has_next={has_next}",
+            file=sys.stderr,
+        )
+
+        if not has_next:
             break
-        after = page.get("endCursor")
-        if not after:
+
+        next_cursor = page.get("endCursor")
+        if not next_cursor:
+            print(
+                "WARNING: hasNextPage=true but endCursor is empty; stopping.",
+                file=sys.stderr,
+            )
             break
-        # No manual sleep here — `_throttle()` inside `ph_call_with_retry`
-        # already enforces both a minimum interval and a 15-minute budget.
+        if next_cursor == after:
+            print(
+                f"WARNING: endCursor did not advance ({next_cursor!r}); stopping.",
+                file=sys.stderr,
+            )
+            break
+        if next_cursor in seen_cursors:
+            print(
+                f"WARNING: repeated endCursor {next_cursor!r} detected; stopping.",
+                file=sys.stderr,
+            )
+            break
+
+        seen_cursors.add(next_cursor)
+        after = next_cursor
+
+    print(
+        f"[pagination done] pages={pages} posts_with_video={len(items)}",
+        file=sys.stderr,
+    )
     return items
 
 
@@ -598,8 +664,7 @@ def upsert_to_turso(posts: list[dict], date_str: str) -> None:
         votes = int(p.get("votesCount") or 0)
         comments = int(p.get("commentsCount") or 0)
         # `p["url"]` is the Product Hunt product page.
-        # `p["website"]` is the PH redirect to the product's own site
-        # (https://www.producthunt.com/r/...?utm_...). Use `url` here.
+        # `p["website"]` is the PH redirect to the product's own site.
         source_link = p.get("url") or ""
         categories_list = p.get("topics") or []
         categories_str = ", ".join(
