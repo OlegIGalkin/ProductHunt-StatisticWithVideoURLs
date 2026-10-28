@@ -45,10 +45,10 @@ MAX_TOTAL_WAIT_SECONDS = int(os.getenv("PH_MAX_TOTAL_WAIT_SECONDS", "900"))
 # PH caps `posts` page size at 20 regardless of what `first` asks for.
 POSTS_PER_PAGE = 20
 
-# Default pagination cap: 60 pages × 20 posts = 1200 top-ranked posts.
-# Each page costs ~100 complexity points, so 60 pages ≈ 6000 points, well
-# within the 6250-point window. Raise this (and increase the workflow's
-# timeout-minutes) if you need deeper coverage of the day's tail.
+# Default pagination cap: 60 pages × 20 posts = 1200 ranked posts.
+# Each page costs ~100 complexity points, so 60 pages ≈ 6000 points,
+# just inside the 6250-point window. Raise this (and increase the
+# workflow's timeout-minutes) if you need deeper coverage of the day's tail.
 MAX_PAGES = int(os.getenv("PH_MAX_PAGES", "60"))
 
 # Client-side sliding window for request spacing. The 450/15min request
@@ -100,12 +100,18 @@ def _throttle() -> None:
 
 
 # --- GraphQL query ----------------------------------------------------------
-# `topics(first: 5)` caps the nested topic connection per post, which is the
-# dominant complexity cost after the base per-page charge.
+# `order: RANKING` pins the sort order explicitly. Without an `order`
+# argument PH's default is unspecified; setting it removes the ambiguity
+# (RANKING is PH's own algorithmic ordering — votes + comments + recency +
+# curation, not pure votes). If you want strict votes-descending, change
+# this to `order: VOTES` (subject to schema availability).
+#
+# `topics(first: 5)` caps the nested topic connection per post, which is
+# the dominant complexity cost after the base per-page charge.
 
 QUERY_POSTS = r"""
 query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: DateTime) {
-  posts(first: $first, after: $after, postedAfter: $postedAfter, postedBefore: $postedBefore) {
+  posts(first: $first, after: $after, order: RANKING, postedAfter: $postedAfter, postedBefore: $postedBefore) {
     pageInfo { hasNextPage endCursor }
     edges {
       node {
@@ -342,10 +348,14 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
 
     PH caps `posts` page size at POSTS_PER_PAGE (20). We also cap total pages
     at MAX_PAGES so a very large day can't exhaust a full 15-minute rate-limit
-    window mid-pagination. The default cap (25 pages = 500 posts) captures
-    the top-ranked launches, which are the ones most likely to have videos.
-    Raise PH_MAX_PAGES (and the workflow's timeout-minutes) if you need
-    deeper coverage.
+    window mid-pagination. The default cap (60 pages = 1200 posts) matches
+    the rate-limit budget with headroom for retries.
+
+    The query uses `order: RANKING`, so the pages arrive in PH's algorithmic
+    ranking order (not strictly votes-descending). The `votes=HIGH..LOW`
+    range on each log line lets you verify the ordering empirically: with
+    RANKING the ranges drift downward but can overlap; with VOTES they'd
+    be strictly descending.
     """
     after = None
     items: list[dict] = []
@@ -355,7 +365,8 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
 
     print(
         f"[pagination start] MAX_PAGES={MAX_PAGES} "
-        f"posts_per_page≤{POSTS_PER_PAGE} range={iso_z(start_local)} .. {iso_z(end_local)}",
+        f"posts_per_page≤{POSTS_PER_PAGE} order=RANKING "
+        f"range={iso_z(start_local)} .. {iso_z(end_local)}",
         file=sys.stderr,
     )
 
@@ -383,10 +394,17 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
         conn = data.get("posts") or {}
         edges = conn.get("edges") or []
 
+        # Collect votes across ALL edges on the page (not just those with
+        # videos) so the logged range reflects PH's actual ordering, not
+        # the post-video-filter subset.
+        page_votes: list[int] = []
+
         for e in edges:
             node = e.get("node")
             if not node:
                 continue
+            page_votes.append(int(node.get("votesCount") or 0))
+
             if "media" not in node or node["media"] is None:
                 node["media"] = []
             video_url = ""
@@ -407,9 +425,15 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
 
         page = conn.get("pageInfo") or {}
         has_next = bool(page.get("hasNextPage"))
+
+        if page_votes:
+            vote_range = f"{max(page_votes)}..{min(page_votes)}"
+        else:
+            vote_range = "n/a"
+
         print(
             f"[page {pages}] edges={len(edges)} kept_total={len(items)} "
-            f"has_next={has_next}",
+            f"votes={vote_range} has_next={has_next}",
             file=sys.stderr,
         )
 
