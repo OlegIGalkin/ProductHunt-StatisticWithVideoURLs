@@ -36,26 +36,24 @@ END_ARCHIVE = "<!-- END:ARCHIVE -->"
 MAX_RETRIES = 8
 
 # Product Hunt's rate-limit window is 15 minutes = 900s. Allow waiting for
-# the full window rather than failing at 840s. Combined with the workflow's
-# timeout-minutes=30, this lets a single 429 wait out the window and resume
-# pagination from the last cursor.
+# the full window rather than failing early.
 RETRY_AFTER_FAIL_THRESHOLD = int(os.getenv("PH_RETRY_AFTER_FAIL_THRESHOLD", "900"))
 
 # Cap total accumulated sleep inside one ph_call_with_retry invocation.
-# Guards against a pathological loop that repeatedly trips 429 with a full
-# 900s reset, which would otherwise keep the job alive for hours.
 MAX_TOTAL_WAIT_SECONDS = int(os.getenv("PH_MAX_TOTAL_WAIT_SECONDS", "900"))
 
-# Cap on how many pagination pages fetch_posts_for_day will ever request.
-# Prevents an infinite loop if PH ever returns hasNextPage=true with a
-# non-advancing cursor. 200 pages × 50 posts = 10 000 posts, well above any
-# realistic day; exceeding it is a bug signal, not a legitimate day size.
-MAX_PAGES = int(os.getenv("PH_MAX_PAGES", "200"))
+# PH caps `posts` page size at 20 regardless of what `first` asks for.
+POSTS_PER_PAGE = 20
+
+# Default pagination cap: 60 pages × 20 posts = 1200 top-ranked posts.
+# Each page costs ~100 complexity points, so 60 pages ≈ 6000 points, well
+# within the 6250-point window. Raise this (and increase the workflow's
+# timeout-minutes) if you need deeper coverage of the day's tail.
+MAX_PAGES = int(os.getenv("PH_MAX_PAGES", "60"))
 
 # Client-side sliding window for request spacing. The 450/15min request
 # budget applies to non-GraphQL endpoints; the /graphql endpoint is bounded
-# by complexity instead (see ph_call_with_retry docstring). We still enforce
-# a minimum spacing to keep bursts tame on CI runners.
+# by complexity instead. We still enforce a minimum spacing for safety.
 REQUEST_BUDGET_WINDOW = 15 * 60  # seconds
 REQUEST_BUDGET_MAX = int(os.getenv("PH_REQUEST_BUDGET_MAX", "400"))
 MIN_REQUEST_INTERVAL = float(os.getenv("PH_MIN_REQUEST_INTERVAL", "0.6"))
@@ -103,9 +101,7 @@ def _throttle() -> None:
 
 # --- GraphQL query ----------------------------------------------------------
 # `topics(first: 5)` caps the nested topic connection per post, which is the
-# dominant complexity cost after the base per-page charge. Posts with >5
-# topics keep their first 5 categories in the catalog — a deliberate trade
-# to fit a busy day inside one 6250-point window.
+# dominant complexity cost after the base per-page charge.
 
 QUERY_POSTS = r"""
 query Posts($first: Int, $after: String, $postedAfter: DateTime, $postedBefore: DateTime) {
@@ -211,10 +207,8 @@ def ph_call_with_retry(token: str, query: str, variables: dict) -> dict:
       complexity window resets) and sleeps exactly that long + jitter.
     - Falls back to `Retry-After` if present.
     - Falls back to exponential backoff only if neither header is present.
-    - Fails fast if the required wait exceeds RETRY_AFTER_FAIL_THRESHOLD
-      (indicates the next scheduled run should pick this up instead).
-    - Caps total accumulated wait at MAX_TOTAL_WAIT_SECONDS so a pathologically
-      rate-limited run can't hang the job for hours.
+    - Fails fast if the required wait exceeds RETRY_AFTER_FAIL_THRESHOLD.
+    - Caps total accumulated wait at MAX_TOTAL_WAIT_SECONDS.
     - Retries transient 5xx responses and URLError / timeouts.
     - Applies a client-side sliding-window budget before every request.
     """
@@ -346,27 +340,41 @@ def get_target_day(tz_name: str):
 def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) -> list[dict]:
     """Paginate `posts` for the given local day.
 
-    Emits one log line per page so the size of the day's post set is visible
-    in the CI log. Guards against non-advancing cursors and runaway page
-    counts, both of which would otherwise look identical to a "really big
-    day" until the rate limit trips.
+    PH caps `posts` page size at POSTS_PER_PAGE (20). We also cap total pages
+    at MAX_PAGES so a very large day can't exhaust a full 15-minute rate-limit
+    window mid-pagination. The default cap (25 pages = 500 posts) captures
+    the top-ranked launches, which are the ones most likely to have videos.
+    Raise PH_MAX_PAGES (and the workflow's timeout-minutes) if you need
+    deeper coverage.
     """
     after = None
     items: list[dict] = []
     pages = 0
     seen_cursors: set[str] = set()
+    stopped_reason = "completed"
+
+    print(
+        f"[pagination start] MAX_PAGES={MAX_PAGES} "
+        f"posts_per_page≤{POSTS_PER_PAGE} range={iso_z(start_local)} .. {iso_z(end_local)}",
+        file=sys.stderr,
+    )
 
     while True:
         pages += 1
         if pages > MAX_PAGES:
+            pages -= 1  # don't count the request we never made
+            stopped_reason = f"cap (MAX_PAGES={MAX_PAGES})"
             print(
-                f"WARNING: exceeded MAX_PAGES={MAX_PAGES}; truncating results.",
+                f"[pagination cap] reached PH_MAX_PAGES={MAX_PAGES} "
+                f"({pages * POSTS_PER_PAGE} posts processed). Day likely has "
+                f"more posts with videos in the tail. To fetch more, raise "
+                f"PH_MAX_PAGES env var and the workflow's timeout-minutes.",
                 file=sys.stderr,
             )
             break
 
         vars_ = {
-            "first": 50,
+            "first": POSTS_PER_PAGE,
             "after": after,
             "postedAfter": iso_z(start_local),
             "postedBefore": iso_z(end_local),
@@ -406,22 +414,26 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
         )
 
         if not has_next:
+            stopped_reason = "end of results"
             break
 
         next_cursor = page.get("endCursor")
         if not next_cursor:
+            stopped_reason = "empty endCursor"
             print(
                 "WARNING: hasNextPage=true but endCursor is empty; stopping.",
                 file=sys.stderr,
             )
             break
         if next_cursor == after:
+            stopped_reason = "cursor did not advance"
             print(
                 f"WARNING: endCursor did not advance ({next_cursor!r}); stopping.",
                 file=sys.stderr,
             )
             break
         if next_cursor in seen_cursors:
+            stopped_reason = "repeated cursor"
             print(
                 f"WARNING: repeated endCursor {next_cursor!r} detected; stopping.",
                 file=sys.stderr,
@@ -432,7 +444,8 @@ def fetch_posts_for_day(token: str, start_local: datetime, end_local: datetime) 
         after = next_cursor
 
     print(
-        f"[pagination done] pages={pages} posts_with_video={len(items)}",
+        f"[pagination done] pages={pages} posts_with_video={len(items)} "
+        f"stopped_reason={stopped_reason}",
         file=sys.stderr,
     )
     return items
