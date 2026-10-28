@@ -35,20 +35,19 @@ END_ARCHIVE = "<!-- END:ARCHIVE -->"
 
 MAX_RETRIES = 8
 
-# If a 429 tells us to wait longer than this, treat it as "quota exhausted for
-# this run" and fail fast so the next scheduled run can pick it up. A 15-minute
-# window reset reports ~900s; anything at/above this threshold is not worth
-# blocking the CI job on.
-RETRY_AFTER_FAIL_THRESHOLD = int(os.getenv("PH_RETRY_AFTER_FAIL_THRESHOLD", "600"))
+# If a 429's reset hint tells us to wait longer than this, treat it as
+# "quota exhausted for this run" and fail fast so the next scheduled run
+# can pick it up. Product Hunt's 15-minute window resets in ~900s at most,
+# and the CI job has timeout-minutes: 15, so anything at/above ~14 min is
+# not worth blocking on.
+RETRY_AFTER_FAIL_THRESHOLD = int(os.getenv("PH_RETRY_AFTER_FAIL_THRESHOLD", "840"))
 
-# Product Hunt allows 450 `posts` queries per 15 minutes. We keep a sliding
-# window client-side so we back off *before* tripping a 429. Leave headroom
-# for other consumers of the same token.
+# Client-side sliding window for request spacing. The 450/15min request
+# budget applies to non-GraphQL endpoints; the /graphql endpoint is bounded
+# by complexity instead (see the docstring on ph_call_with_retry). We still
+# enforce a minimum spacing to keep bursts tame on CI runners.
 REQUEST_BUDGET_WINDOW = 15 * 60  # seconds
 REQUEST_BUDGET_MAX = int(os.getenv("PH_REQUEST_BUDGET_MAX", "400"))
-
-# Minimum spacing between PH requests (seconds). Additional to the sliding
-# window; keeps bursts tame on CI runners.
 MIN_REQUEST_INTERVAL = float(os.getenv("PH_MIN_REQUEST_INTERVAL", "0.6"))
 
 # --- Sliding-window rate limiter -------------------------------------------
@@ -158,18 +157,44 @@ def build_description_cell(tagline: str) -> str:
     return short if short else "—"
 
 
+# --- Rate-limit header helpers ---------------------------------------------
+# Product Hunt returns rate-limit info under these EXACT header names.
+# Note the hyphens: `X-Rate-Limit-Reset` — NOT `X-RateLimit-Reset`.
+
+_RATE_HEADERS = (
+    "X-Rate-Limit-Limit",
+    "X-Rate-Limit-Remaining",
+    "X-Rate-Limit-Reset",
+    "Retry-After",
+)
+
+
+def _header_int(headers, name: str) -> int | None:
+    """Return a header value as int, or None if absent / non-numeric.
+
+    Python's http.client HTTPMessage is case-insensitive for `.get()`, so
+    header name casing here is for readability only.
+    """
+    if headers is None:
+        return None
+    raw = headers.get(name)
+    if raw is None:
+        return None
+    try:
+        # PH occasionally emits "850.0" — accept floats that look like ints.
+        return int(float(raw))
+    except (ValueError, TypeError):
+        return None
+
+
 def _log_rate_headers(headers, prefix: str = "") -> None:
     """Print whatever rate-limit headers PH exposed (when present)."""
-    interesting = (
-        "X-RateLimit-Limit",
-        "X-RateLimit-Remaining",
-        "X-RateLimit-Reset",
-        "Retry-After",
-    )
+    if headers is None:
+        return
     parts = []
-    for k in interesting:
+    for k in _RATE_HEADERS:
         v = headers.get(k)
-        if v:
+        if v is not None:
             parts.append(f"{k}={v}")
     if parts:
         print(f"{prefix}rate-limit: " + " ".join(parts), file=sys.stderr)
@@ -178,10 +203,14 @@ def _log_rate_headers(headers, prefix: str = "") -> None:
 def ph_call_with_retry(token: str, query: str, variables: dict) -> dict:
     """Call the PH GraphQL API with robust 429 / 5xx / network retry.
 
-    - Honours `Retry-After` on 429 (falls back to exponential backoff with jitter).
+    Rate-limit behaviour:
+    - On 429, prefers `X-Rate-Limit-Reset` (seconds until the current
+      complexity window resets) and sleeps exactly that long + jitter.
+    - Falls back to `Retry-After` if present.
+    - Falls back to exponential backoff only if neither header is present.
+    - Fails fast if the required wait exceeds RETRY_AFTER_FAIL_THRESHOLD
+      (indicates the next scheduled run should pick this up instead).
     - Retries transient 5xx responses and URLError / timeouts.
-    - Fails fast if `Retry-After` exceeds `RETRY_AFTER_FAIL_THRESHOLD`
-      (indicates an exhausted window that won't recover inside this run).
     - Applies a client-side sliding-window budget before every request.
     """
     last_exc: Exception | None = None
@@ -213,23 +242,33 @@ def ph_call_with_retry(token: str, query: str, variables: dict) -> dict:
             last_exc = e
 
             if e.code == 429:
-                retry_after = e.headers.get("Retry-After")
-                if retry_after and retry_after.isdigit():
+                _log_rate_headers(e.headers, prefix="429 ")
+
+                reset = _header_int(e.headers, "X-Rate-Limit-Reset")
+                retry_after = _header_int(e.headers, "Retry-After")
+
+                if reset is not None and reset > 0:
+                    delay = float(reset)
+                    hint = f"X-Rate-Limit-Reset={reset}"
+                elif retry_after is not None and retry_after > 0:
                     delay = float(retry_after)
+                    hint = f"Retry-After={retry_after}"
                 else:
                     delay = min(60.0 * (2 ** attempt), 900.0)
+                    hint = "exponential fallback"
+
                 # Jitter avoids two runs colliding on the same reset instant.
-                delay += random.uniform(0, 5)
-                _log_rate_headers(e.headers, prefix="429 ")
+                delay += random.uniform(1, 5)
+
                 print(
                     f"Rate limited (429). attempt={attempt + 1}/{MAX_RETRIES} "
-                    f"Retry-After={retry_after} sleeping {delay:.1f}s",
+                    f"source={hint} sleeping {delay:.1f}s",
                     file=sys.stderr,
                 )
 
                 if delay > RETRY_AFTER_FAIL_THRESHOLD:
                     print(
-                        f"Retry-After ({delay:.0f}s) exceeds "
+                        f"Required wait ({delay:.0f}s) exceeds "
                         f"PH_RETRY_AFTER_FAIL_THRESHOLD="
                         f"{RETRY_AFTER_FAIL_THRESHOLD}s — likely quota exhaustion; "
                         f"not retrying (next scheduled run will pick this up).",
